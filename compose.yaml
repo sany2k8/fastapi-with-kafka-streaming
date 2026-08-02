@@ -1,0 +1,162 @@
+name: fraud-detection
+
+services:
+  # ---------------------------------------------------------------------------
+  # Kafka, single broker, KRaft mode (no ZooKeeper).
+  # One broker is enough to learn everything except replication.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: fraud-kafka
+    ports:
+      - "29098:29098" # EXTERNAL listener, for tools running on your Mac
+    environment:
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29098
+      # Containers reach the broker as kafka:9092; your Mac reaches it as localhost:29098.
+      # A client always reconnects to the ADVERTISED address, so both must be correct.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29098
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # Single broker => nothing can be replicated more than once.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Don't wait for more group members before rebalancing - makes local restarts instant.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by the API on startup, with a partition count
+      # we chose on purpose. Auto-creation would silently give us 1 partition.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+    mem_limit: 1g
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: fraud-postgres
+    ports:
+      - "5436:5432"
+    environment:
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: fraud
+      POSTGRES_DB: fraud
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud -d fraud"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+
+  # ---------------------------------------------------------------------------
+  # FastAPI payment API - the only synchronous part of the system.
+  # It writes the payment and publishes payment.created. It never scores.
+  # ---------------------------------------------------------------------------
+  api:
+    build: ./backend
+    container_name: fraud-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8700:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql+asyncpg://fraud:fraud@postgres:5432/fraud
+    volumes:
+      - ./backend/app:/app/app:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    mem_limit: 512m
+
+  # ---------------------------------------------------------------------------
+  # Consumer 1: group "fraud-detector" on payment.events.
+  # Scale it with:  docker compose up -d --scale fraud-detector=3
+  # Three instances, three partitions => one partition each.
+  # ---------------------------------------------------------------------------
+  fraud-detector:
+    build: ./backend
+    command: python -m app.consumers.fraud_detector
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql+asyncpg://fraud:fraud@postgres:5432/fraud
+    volumes:
+      - ./backend/app:/app/app:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 384m
+
+  # ---------------------------------------------------------------------------
+  # Consumer 2: group "decision-writer" on fraud.events - the only writer of
+  # the final payment status and of fraud_decisions.
+  # ---------------------------------------------------------------------------
+  decision-writer:
+    build: ./backend
+    container_name: fraud-decision-writer
+    command: python -m app.consumers.decision_writer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql+asyncpg://fraud:fraud@postgres:5432/fraud
+    volumes:
+      - ./backend/app:/app/app:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 384m
+
+  # ---------------------------------------------------------------------------
+  # Consumer 3: group "audit-logger", SAME topic as decision-writer.
+  # It exists to prove fan-out: two groups both receive every fraud event and
+  # track their offsets independently.
+  # ---------------------------------------------------------------------------
+  audit-logger:
+    build: ./backend
+    container_name: fraud-audit-logger
+    command: python -m app.consumers.audit_logger
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql+asyncpg://fraud:fraud@postgres:5432/fraud
+    volumes:
+      - ./backend/app:/app/app:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 384m
+
+  # Visual cross-check for everything the /kafka/inspect endpoint reports.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: fraud-kafka-ui
+    ports:
+      - "8092:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+      JAVA_OPTS: -Xmx256m
+    depends_on:
+      kafka:
+        condition: service_healthy
+    profiles: ["tools"]
+    mem_limit: 512m
+
+volumes:
+  postgres-data:
