@@ -157,6 +157,14 @@ Chosen to coexist with other local stacks — none are Kafka/Postgres defaults.
 
 ---
 
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [How Fraud Detection Works](docs/how-fraud-detection-works.md) | One payment followed through every stage — API → Postgres → Kafka → detector → risk engine → Kafka → Postgres → client, with the real log trace |
+| [The Fraud Rules](docs/fraud-rules.md) | All five rules: config, SQL, worked examples that fire and that don't, how to trigger each one, limitations |
+| [Point-in-Time Evaluation](docs/why-at-vs-now.md) | Why rules anchor to the payment's timestamp instead of `now()` |
+
 ## Kafka concepts, and where each one lives in the code
 
 | Concept | Where to look | What to notice |
